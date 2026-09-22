@@ -18,6 +18,12 @@ describe("parseLocaleAmount", () => {
     expect(parseLocaleAmount("(45,20)", "es-ES").minor).toBe(-4520n);
   });
 
+  it("handles a trailing ISO currency code with no separating space (CaixaBank export)", () => {
+    expect(parseLocaleAmount("-74,00EUR", "es-ES").minor).toBe(-7400n);
+    expect(parseLocaleAmount("280,00EUR", "es-ES").minor).toBe(28000n);
+    expect(parseLocaleAmount("1.234,56 EUR", "es-ES").minor).toBe(123456n);
+  });
+
   it("handles amounts without a decimal part", () => {
     expect(parseLocaleAmount("1.234", "es-ES").minor).toBe(123400n);
   });

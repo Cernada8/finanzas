@@ -18,8 +18,10 @@ export function parseLocaleAmount(raw: string, locale: SupportedLocale, currency
   let s = raw.trim();
   if (s === "") return { ok: false, error: "empty amount" };
 
-  // Strip currency symbols/spaces, keep sign and digits/separators.
-  s = s.replace(/[€$£\s]/g, "");
+  // Strip currency symbols/spaces, keep sign and digits/separators. Also strips a trailing
+  // 3-letter ISO currency code glued directly onto the number (e.g. CaixaBank's "-74,00EUR",
+  // no space, no symbol) as well as one with a leading space ("74,00 EUR").
+  s = s.replace(/[€$£\s]/g, "").replace(/[A-Za-z]{3}$/, "");
   let negative = false;
   if (s.startsWith("-")) {
     negative = true;
