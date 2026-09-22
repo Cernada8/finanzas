@@ -1,0 +1,537 @@
+// Spending & Investment Dashboard — Prisma schema
+// Decimal fields use fixed precision suitable for money/units/prices/FX.
+// See docs/architecture.md and docs/financial-methodology.md for rationale.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Ownership / auth
+// ---------------------------------------------------------------------------
+
+model Owner {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  displayName  String
+  locale       String   @default("es-ES") // number/date formatting
+  language     String   @default("en")    // interface language
+  reportingCcy String   @default("EUR")
+  timezone     String   @default("Europe/Madrid")
+  isDemo       Boolean  @default(false) // demo-workspace owners are isolated
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  institutions      Institution[]
+  accounts          Account[]
+  categories        Category[]
+  rules             Rule[]
+  budgets           Budget[]
+  importBatches     ImportBatch[]
+  auditEvents       AuditEvent[]
+  transactions      Transaction[]
+  transferMatches   TransferMatch[]
+  syncRuns          SyncRun[]
+  sessions          Session[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  ownerId   String
+  owner     Owner    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  sessionToken String @unique
+  expires   DateTime
+}
+
+// ---------------------------------------------------------------------------
+// Institutions / connections
+// ---------------------------------------------------------------------------
+
+enum ProviderKind {
+  DEMO
+  IMPORT
+  CAIXABANK_PSD2
+  IMAGIN_PSD2
+  MYINVESTOR_PSD2
+  TRADE_REPUBLIC_UNSUPPORTED // deliberately never enabled by default; see docs
+}
+
+enum ConnectionStatus {
+  UNCONFIGURED
+  CONNECTING
+  CONSENT_REQUIRED
+  SYNCING
+  CURRENT
+  STALE
+  PARTIALLY_SUPPORTED
+  FAILED
+  DISCONNECTED
+}
+
+model Institution {
+  id           String       @id @default(cuid())
+  ownerId      String
+  owner        Owner        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name         String // e.g. "imagin", "CaixaBank", "Trade Republic", "MyInvestor", "Demo Bank"
+  providerKind ProviderKind
+  country      String       @default("ES")
+  createdAt    DateTime     @default(now())
+
+  connections Connection[]
+  accounts    Account[]
+
+  @@index([ownerId])
+}
+
+model Connection {
+  id                String            @id @default(cuid())
+  institutionId     String
+  institution       Institution       @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  status            ConnectionStatus  @default(UNCONFIGURED)
+  capabilities      Json // e.g. { accounts:true, balances:true, transactions:true, holdings:false, activities:false, prices:false }
+  historyDepthDays  Int?
+  // Encrypted at rest via application-layer envelope encryption (see docs/architecture.md).
+  // NEVER store plaintext provider credentials/tokens.
+  encryptedAccessToken  String?
+  encryptedRefreshToken String?
+  tokenCipherVersion    Int?      // key-rotation marker
+  consentExpiresAt DateTime?
+  lastSuccessAt     DateTime?
+  lastAttemptAt     DateTime?
+  lastErrorRedacted String? // sanitized, no stack traces / secrets
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  syncRuns SyncRun[]
+
+  @@index([institutionId])
+}
+
+enum SyncTrigger {
+  MANUAL
+  SCHEDULED
+  WEBHOOK
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+model SyncRun {
+  id           String     @id @default(cuid())
+  connectionId String
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  ownerId      String
+  owner        Owner      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  trigger      SyncTrigger
+  status       SyncStatus @default(RUNNING)
+  startedAt    DateTime   @default(now())
+  finishedAt   DateTime?
+  checkpoint   Json? // durable cursor/pagination state, per capability
+  recordsRead    Int @default(0)
+  recordsWritten Int @default(0)
+  errorRedacted  String?
+
+  @@index([connectionId])
+  @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------------
+// Accounts / balances
+// ---------------------------------------------------------------------------
+
+enum AccountKind {
+  CASH
+  CARD
+  BROKERAGE_CASH
+  INVESTMENT
+  LOAN
+  OTHER
+}
+
+model Account {
+  id            String      @id @default(cuid())
+  ownerId       String
+  owner         Owner       @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  institutionId String
+  institution   Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  externalId    String? // provider's account identifier, when known
+  name          String
+  kind          AccountKind
+  currency      String // ISO 4217
+  includeInNetWorth Boolean @default(true)
+  isLiability   Boolean @default(false)
+  createdAt     DateTime    @default(now())
+
+  balances     BalanceSnapshot[]
+  transactions Transaction[]
+  holdings     HoldingSnapshot[]
+  activities   InvestmentActivity[]
+
+  @@unique([institutionId, externalId])
+  @@index([ownerId])
+}
+
+model BalanceSnapshot {
+  id          String   @id @default(cuid())
+  accountId   String
+  account     Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  asOf        DateTime // provider-reported observation timestamp
+  bookedMinor BigInt   // integer minor units (cents) — avoids float error
+  pendingMinor BigInt  @default(0)
+  currency    String
+  source      String // "provider" | "import" | "manual"
+  createdAt   DateTime @default(now())
+
+  @@index([accountId, asOf])
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+enum EconomicClass {
+  INCOME
+  EXPENSE
+  REFUND
+  INTERNAL_TRANSFER
+  INVESTMENT_CASH_FLOW
+  UNRESOLVED
+}
+
+enum TxStatus {
+  PENDING
+  BOOKED
+}
+
+model Transaction {
+  id            String        @id @default(cuid())
+  ownerId       String
+  owner         Owner         @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  accountId     String
+  account       Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // Provenance — immutable source observation
+  sourceRecordId String?      @unique
+  sourceRecord   SourceRecord? @relation(fields: [sourceRecordId], references: [id])
+
+  // Dates — bank-provided date-only values are preserved without UTC shifting
+  transactionDate DateTime // when the transaction occurred (date-only, stored at 00:00 local)
+  valueDate       DateTime?
+  bookedDate      DateTime? // authoritative for monthly reporting once status=BOOKED
+
+  status        TxStatus @default(BOOKED)
+  amountMinor   BigInt   // signed integer minor units in `currency` (source currency)
+  currency      String
+  description   String
+  rawDescription String
+
+  economicClass EconomicClass @default(UNRESOLVED)
+  categoryId    String?
+  category      Category?     @relation(fields: [categoryId], references: [id])
+
+  merchant      String?
+  // classification provenance: user correction > rule > provider suggestion
+  classificationSource String @default("provider") // "user" | "rule" | "provider"
+  appliedRuleId String?
+  appliedRule   Rule? @relation(fields: [appliedRuleId], references: [id])
+
+  // Idempotency / dedup
+  dedupeKey     String  @unique // hash(accountId, bookedDate/transactionDate, amountMinor, normalizedDescription)
+
+  // Refund linkage
+  refundOfId    String?
+  refundOf      Transaction? @relation("RefundLink", fields: [refundOfId], references: [id])
+  refundedBy    Transaction[] @relation("RefundLink")
+
+  notes         String?
+
+  splits        TransactionSplit[]
+  legAsFrom     TransferMatch[] @relation("FromLeg")
+  legAsTo       TransferMatch[] @relation("ToLeg")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId, bookedDate])
+  @@index([accountId])
+  @@index([economicClass])
+}
+
+model TransactionSplit {
+  id            String      @id @default(cuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      Category?   @relation(fields: [categoryId], references: [id])
+  amountMinor   BigInt // must sum exactly to parent amountMinor across all splits
+  note          String?
+
+  @@index([transactionId])
+}
+
+enum TransferMatchStatus {
+  CONFIRMED
+  CANDIDATE
+  REJECTED
+}
+
+model TransferMatch {
+  id           String   @id @default(cuid())
+  ownerId      String
+  owner        Owner    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fromTxId     String
+  fromTx       Transaction @relation("FromLeg", fields: [fromTxId], references: [id])
+  toTxId       String
+  toTx         Transaction @relation("ToLeg", fields: [toTxId], references: [id])
+  status       TransferMatchStatus @default(CANDIDATE)
+  confidence   Float // 0..1 heuristic score
+  matchedBy    String // "amount+date+ownership" etc.
+  createdAt    DateTime @default(now())
+
+  @@unique([fromTxId, toTxId])
+  @@index([ownerId])
+}
+
+model Category {
+  id       String  @id @default(cuid())
+  ownerId  String
+  owner    Owner   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name     String
+  kind     String // "income" | "expense" | "transfer" | "investment"
+  parentId String?
+  parent   Category? @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  color    String?
+
+  transactions Transaction[]
+  splits       TransactionSplit[]
+  rules        Rule[]
+  budgets      Budget[]
+
+  @@unique([ownerId, name])
+}
+
+model Rule {
+  id          String   @id @default(cuid())
+  ownerId     String
+  owner       Owner    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  // Simple deterministic matcher: all conditions AND-ed.
+  matchDescriptionContains String?
+  matchMerchant            String?
+  matchAccountId           String?
+  matchMinAmountMinor      BigInt?
+  matchMaxAmountMinor      BigInt?
+  setCategoryId String?
+  setCategory   Category? @relation(fields: [setCategoryId], references: [id])
+  setEconomicClass EconomicClass?
+  priority     Int      @default(100) // lower runs first
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  transactions Transaction[]
+
+  @@index([ownerId])
+}
+
+model Budget {
+  id         String   @id @default(cuid())
+  ownerId    String
+  owner      Owner    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+  name       String
+  monthlyLimitMinor BigInt
+  currency   String @default("EUR")
+  startMonth String // "YYYY-MM"
+  endMonth   String? // null = open-ended
+
+  @@index([ownerId])
+}
+
+// ---------------------------------------------------------------------------
+// Imports & provenance
+// ---------------------------------------------------------------------------
+
+enum ImportFileType {
+  CSV
+  XLSX
+  PDF
+}
+
+enum ImportStatus {
+  PREVIEW
+  VALIDATED
+  COMMITTED
+  FAILED
+}
+
+model ImportBatch {
+  id           String         @id @default(cuid())
+  ownerId      String
+  owner        Owner          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fileName     String
+  fileType     ImportFileType
+  fileHash     String // sha256 — reimport of identical file is idempotent
+  targetAccountId String?
+  columnMapping   Json
+  locale          String @default("es-ES")
+  status          ImportStatus @default(PREVIEW)
+  parserName      String  @default("generic-csv")
+  parserVersion   String  @default("1.0.0")
+  rowsTotal       Int @default(0)
+  rowsImported    Int @default(0)
+  rowsDuplicate   Int @default(0)
+  rowsErrored     Int @default(0)
+  errors          Json? // row-level errors
+  createdAt       DateTime @default(now())
+  committedAt     DateTime?
+
+  @@unique([ownerId, fileHash])
+  @@index([ownerId])
+}
+
+model SourceRecord {
+  id            String   @id @default(cuid())
+  origin        String // "import" | "provider"
+  importBatchId String?
+  providerName  String?
+  rawPayload    Json // as received, for audit/debug (no plaintext secrets)
+  observedAt    DateTime @default(now())
+
+  transaction Transaction?
+}
+
+// ---------------------------------------------------------------------------
+// Investments
+// ---------------------------------------------------------------------------
+
+enum AssetType {
+  EQUITY
+  ETF
+  FUND
+  BOND
+  CRYPTO
+  CASH
+  OTHER
+}
+
+model Instrument {
+  id       String    @id @default(cuid())
+  isin     String?
+  ticker   String?
+  name     String
+  assetType AssetType
+  currency  String
+
+  holdings   HoldingSnapshot[]
+  activities InvestmentActivity[]
+  prices     PriceObservation[]
+
+  @@unique([isin, ticker, name])
+}
+
+model HoldingSnapshot {
+  id           String     @id @default(cuid())
+  accountId    String
+  account      Account    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  instrumentId String
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  asOf         DateTime // observation date — never back-filled from present-day snapshot
+  units        Decimal    @db.Decimal(28, 10)
+  // Remaining cost basis in account currency, when known (analytical lot policy, not tax accounting)
+  costBasisMinor BigInt?
+  costBasisCcy   String?
+  source         String // "provider" | "import" | "derived"
+  isAuthoritativeComplete Boolean @default(false) // true only if snapshot is a complete broker statement
+
+  @@index([accountId, asOf])
+  @@index([instrumentId])
+}
+
+enum ActivityType {
+  BUY
+  SELL
+  DIVIDEND
+  INTEREST
+  FEE
+  TAX
+  TRANSFER_IN
+  TRANSFER_OUT
+  CORPORATE_ACTION
+}
+
+model InvestmentActivity {
+  id           String       @id @default(cuid())
+  accountId    String
+  account      Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  instrumentId String?
+  instrument   Instrument?  @relation(fields: [instrumentId], references: [id])
+  type         ActivityType
+  tradeDate    DateTime
+  settlementDate DateTime?
+  units        Decimal? @db.Decimal(28, 10)
+  priceMinor   BigInt? // execution price, minor units
+  grossAmountMinor BigInt
+  feeMinor     BigInt @default(0)
+  taxMinor     BigInt @default(0)
+  currency     String
+  // Whether this activity counts as an EXTERNAL flow for MWR/XIRR purposes
+  isExternalFlow Boolean @default(false)
+  dedupeKey    String @unique
+  source       String // "provider" | "import"
+  notes        String?
+
+  @@index([accountId, tradeDate])
+}
+
+model PriceObservation {
+  id           String     @id @default(cuid())
+  instrumentId String
+  instrument   Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  asOf         DateTime
+  priceMinor   BigInt // in `currency`, minor units
+  currency     String
+  source       String // "provider" | "manual" | "import"
+
+  @@unique([instrumentId, asOf, source])
+}
+
+model FxObservation {
+  id        String   @id @default(cuid())
+  baseCcy   String
+  quoteCcy  String
+  asOf      DateTime
+  rate      Decimal  @db.Decimal(20, 10) // 1 base = rate quote
+  source    String
+
+  @@unique([baseCcy, quoteCcy, asOf, source])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditEvent {
+  id        String   @id @default(cuid())
+  ownerId   String
+  owner     Owner    @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  action    String // "login" | "export" | "delete" | "rule.apply" | "import.commit" | ...
+  entity    String?
+  entityId  String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([ownerId, createdAt])
+}
